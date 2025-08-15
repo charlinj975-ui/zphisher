@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""
+phish_guard.py — Simple URL risk scorer for phishing indicators (defensive use only)
+
+Usage:
+  python phish_guard.py https://example.com/login
+  python phish_guard.py -f urls.txt
+"""
+
+import argparse, re, sys, math
+from urllib.parse import urlparse
+
+SUSPICIOUS_TLDS = {
+    "zip","cam","mom","click","country","gq","ml","cf","tk","top","xyz","pw","info","work","quest","monster"
+}
+
+# Common brand keywords to protect; expand for your org
+BRANDS = {"google","microsoft","outlook","office","paypal","amazon","facebook","instagram","apple","icici","sbi","hdfc"}
+
+HOMOGLYPHS = str.maketrans({
+    "0":"o","1":"l","3":"e","5":"s","7":"t","@":"a","$":"s"
+})
+
+def looks_like_ip(host):
+    # IPv4
+    if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", host or ""):
+        return True
+    # hex/octal dotted or decimal integer forms are rare but used by kits; keep it simple
+    return False
+
+def has_punycode(host):
+    return host and ("xn--" in host.lower())
+
+def subdomain_count(host):
+    if not host: return 0
+    parts = host.split(".")
+    return max(0, len(parts) - 2)
+
+def brand_typos_or_impersonation(host):
+    """
+    Very lightweight check: normalize common homoglyphs and see if brand
+    names appear as substrings (e.g., paypa1 -> paypal).
+    """
+    if not host: return []
+    norm = host.translate(HOMOGLYPHS)
+    hits = []
+    for b in BRANDS:
+        if b in norm and b not in safe_brand_positions(norm):
+            hits.append(b)
+    return hits
+
+def safe_brand_positions(host):
+    """
+    Allow brand in obvious safe positions like 'login.microsoftonline.com'
+    by whitelisting known corporate domains if you want.
+    Keep empty for a generic demo.
+    """
+    return set()
+
+def score_url(u):
+    parsed = urlparse(u.strip())
+    score = 0
+    reasons = []
+
+    if parsed.scheme not in ("http", "https"):
+        reasons.append("Non-web scheme"); score += 2
+
+    host = (parsed.hostname or "").lower()
+
+    if parsed.scheme == "http":
+        reasons.append("No HTTPS"); score += 2
+
+    if looks_like_ip(host):
+        reasons.append("Host is an IP literal"); score += 3
+
+    if has_punycode(host):
+        reasons.append("Punycode in host"); score += 3
+
+    tld = host.split(".")[-1] if host else ""
+    if tld in SUSPICIOUS_TLDS:
+        reasons.append(f"Suspicious TLD: .{tld}"); score += 2
+
+    subs = subdomain_count(host)
+    if subs >= 3:
+        reasons.append(f"Many subdomains ({subs})"); score += 2
+
+    full = u.strip()
+    if len(full) > 120:
+        reasons.append("Very long URL"); score += 1
+    if "@" in full:
+        reasons.append("'@' present (obfuscation)"); score += 2
+    if re.search(r"%[0-9A-Fa-f]{2}", full) and len(full) > 90:
+        reasons.append("Heavily encoded path/query"); score += 1
+
+    # Path-based login bait
+    if re.search(r"/(login|signin|verify|update|secure|account)[/?]", parsed.path.lower()):
+        reasons.append("Login/verify keyword in path"); score += 1
+
+    # Brand impersonation
+    hits = brand_typos_or_impersonation(host)
+    if hits:
+        reasons.append(f"Brand lookalike in host: {', '.join(sorted(hits))}")
+        score += 3
+
+    # Rough, bounded risk level
+    risk = "low"
+    if score >= 6: risk = "high"
+    elif score >= 3: risk = "medium"
+
+    return {
+        "url": u.strip(),
+        "risk": risk,
+        "score": score,
+        "reasons": reasons
+    }
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("url", nargs="?", help="Single URL to check")
+    ap.add_argument("-f", "--file", help="Path to a file of URLs (one per line)")
+    args = ap.parse_args()
+
+    targets = []
+    if args.url:
+        targets.append(args.url)
+    if args.file:
+        with open(args.file, "r", encoding="utf-8") as fh:
+            targets += [line.strip() for line in fh if line.strip()]
+
+    if not targets:
+        print("Provide a URL or -f file.txt", file=sys.stderr)
+        sys.exit(2)
+
+    for u in targets:
+        res = score_url(u)
+        print(f"[{res['risk'].upper():>5}] ({res['score']}) {res['url']}")
+        if res["reasons"]:
+            print("      ↳ " + "; ".join(res["reasons"]))
+
+if __name__ == "__main__":
+    main()
